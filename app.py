@@ -18,14 +18,15 @@ def get_direct_gdrive_link(url):
     # Match a Google Sheets link
     sheets_match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
     if sheets_match:
-        return f"https://docs.google.com/spreadsheets/d/{sheets_match.group(1)}/export?format=csv"
+        # Route through Google's Visualization API (Bypasses the 401 script-blocker)
+        return f"https://docs.google.com/spreadsheets/d/{sheets_match.group(1)}/gviz/tq?tqx=out:csv"
     
     # Match a standard Google Drive file link
     drive_match = re.search(r'/file/d/([a-zA-Z0-9-_]+)', url)
     if drive_match:
         return f"https://drive.google.com/uc?id={drive_match.group(1)}&export=download"
         
-    # If it doesn't match Google's format, just return the raw URL and hope for the best
+    # If it doesn't match Google's format, return the raw URL
     return url
 
 def process_beauhurst_file(file):
