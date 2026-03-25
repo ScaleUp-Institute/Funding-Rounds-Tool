@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +13,21 @@ st.set_page_config(page_title="Beauhurst Funding Explorer", page_icon="💷", la
 # ==========================================
 # DATA PROCESSING ENGINE (The "Brain")
 # ==========================================
+def get_direct_gdrive_link(url):
+    """Converts a standard Google Drive or Sheets share link into a direct CSV download link."""
+    # Match a Google Sheets link
+    sheets_match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+    if sheets_match:
+        return f"https://docs.google.com/spreadsheets/d/{sheets_match.group(1)}/export?format=csv"
+    
+    # Match a standard Google Drive file link
+    drive_match = re.search(r'/file/d/([a-zA-Z0-9-_]+)', url)
+    if drive_match:
+        return f"https://drive.google.com/uc?id={drive_match.group(1)}&export=download"
+        
+    # If it doesn't match Google's format, just return the raw URL and hope for the best
+    return url
+
 def process_beauhurst_file(file):
     """Reads a raw Beauhurst file, detects its format, and unpivots it cleanly."""
     raw = pd.read_csv(file, low_memory=False)
@@ -162,30 +178,51 @@ if 'master_df' not in st.session_state:
 # --- SIDEBAR: DATA UPLOAD & PROCESSING ---
 with st.sidebar:
     st.header("📂 1. Upload Data")
+    
+    # Option A: File Upload
     uploaded_files = st.file_uploader("Upload Raw Beauhurst CSVs", type=['csv'], accept_multiple_files=True)
     
+    st.markdown("**OR**")
+    
+    # Option B: URL Paste
+    gdrive_url = st.text_input("Paste a Google Drive / Sheets Link", placeholder="https://docs.google.com/spreadsheets/...")
+    st.caption("⚠️ *Note: The Google file must be set to 'Anyone with the link can view'.*")
+    
     if st.button("Process & Merge Files", type="primary"):
-        if uploaded_files:
+        if uploaded_files or gdrive_url:
             with st.spinner("Processing files... this might take a minute."):
                 all_dfs = []
-                for file in uploaded_files:
-                    clean_df = process_beauhurst_file(file)
-                    all_dfs.append(clean_df)
                 
-                # Merge and deduplicate
-                master_df = pd.concat(all_dfs, ignore_index=True)
-                master_df = master_df.drop_duplicates(subset=["RoundIDKey", "InvestorName"], keep="first")
+                # 1. Process directly uploaded files
+                if uploaded_files:
+                    for file in uploaded_files:
+                        all_dfs.append(process_beauhurst_file(file))
                 
-                # Consolidate Scottish Regions
-                master_df['Region_Clean'] = master_df['Company Region'].astype(str).str.lower().str.strip()
-                master_df.loc[master_df['Region_Clean'].isin(['aberdeen', 'east of scotland', 'highlands and islands', 'south of scotland', 'tayside', 'west of scotland']), 'Region_Clean'] = 'scotland'
-                master_df['Region_Display'] = master_df['Region_Clean'].str.title()
+                # 2. Process the Google Drive URL
+                if gdrive_url:
+                    try:
+                        direct_url = get_direct_gdrive_link(gdrive_url)
+                        # process_beauhurst_file accepts URLs just as easily as local files!
+                        all_dfs.append(process_beauhurst_file(direct_url)) 
+                    except Exception as e:
+                        st.error(f"Could not read from URL. Ensure it's a public CSV/Sheet. Error: {e}")
+                        st.stop()
                 
-                # Save to state
-                st.session_state.master_df = master_df
-            st.success("✅ Data processed successfully!")
+                # 3. Merge and deduplicate
+                if all_dfs:
+                    master_df = pd.concat(all_dfs, ignore_index=True)
+                    master_df = master_df.drop_duplicates(subset=["RoundIDKey", "InvestorName"], keep="first")
+                    
+                    # Consolidate Scottish Regions
+                    master_df['Region_Clean'] = master_df['Company Region'].astype(str).str.lower().str.strip()
+                    master_df.loc[master_df['Region_Clean'].isin(['aberdeen', 'east of scotland', 'highlands and islands', 'south of scotland', 'tayside', 'west of scotland']), 'Region_Clean'] = 'scotland'
+                    master_df['Region_Display'] = master_df['Region_Clean'].str.title()
+                    
+                    # Save to state
+                    st.session_state.master_df = master_df
+                    st.success("✅ Data processed successfully!")
         else:
-            st.warning("Please upload at least one CSV file.")
+            st.warning("Please upload a file or paste a link to begin.")
 
 # Stop execution if no data is loaded yet
 if st.session_state.master_df is None:
