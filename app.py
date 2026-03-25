@@ -15,7 +15,7 @@ st.markdown("Explore funding rounds, top investors, and leading advisors across 
 @st.cache_data
 def load_data():
     # Update this path if running locally
-    df = pd.read_csv('bh_rounds_combined_all.csv', low_memory=False)
+    df = pd.read_csv('Full Cohort Funding Rounds.csv', low_memory=False)
     
     # Standardize the Equity flag
     if 'IsEquityRound' in df.columns:
