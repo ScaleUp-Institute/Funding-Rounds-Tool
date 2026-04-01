@@ -341,19 +341,62 @@ with col_right:
 # DATA DOWNLOAD
 # ==========================================
 st.markdown("---")
-st.subheader("📄 Filtered Data")
+st.subheader("📄 Download Data")
 
 @st.cache_data
-def convert_df(df):
-    return df.to_csv(index=False).encode('utf-8')
+def convert_df(df_to_convert):
+    return df_to_convert.to_csv(index=False).encode('utf-8')
 
-csv = convert_df(df)
+# Create two columns for the two download options
+col_dl1, col_dl2 = st.columns(2)
 
-st.download_button(
-    label="⬇️ Download Processed Dataset (CSV)",
-    data=csv,
-    file_name='processed_beauhurst_rounds.csv',
-    mime='text/csv',
-)
+with col_dl1:
+    st.markdown("**Long Format (1 Row per Investor)**")
+    st.caption("Best for analyzing investor behavior, countries, and leaderboards.")
+    csv_long = convert_df(df)
+    st.download_button(
+        label="⬇️ Download Investor-Level Dataset",
+        data=csv_long,
+        file_name='beauhurst_investors_long.csv',
+        mime='text/csv',
+    )
 
-st.dataframe(df[['CompanyName', 'RoundDate', 'RoundAmountGBP_total', 'Company Region', 'FormOfFunding', 'InvestorName']].head(50), use_container_width=True)
+with col_dl2:
+    st.markdown("**Flat Format (1 Row per Funding Round)**")
+    st.caption("Best for analyzing company funding totals and timelines.")
+    
+    # Create the non-duplicated version on the fly
+    # We group by the unique round key and take the first value for company stats, 
+    # but we join the investor names together!
+    df_flat = df.groupby('RoundIDKey').agg({
+        'CompanyName': 'first',
+        'CompaniesHouseID': 'first',
+        'IncorporationDate': 'first',
+        'RoundDate': 'first',
+        'RoundAmountGBP_total': 'first',
+        'Company Region': 'first',
+        'Company Local Authority': 'first',
+        'FormOfFunding': 'first',
+        'IsEquityRound': 'first',
+        'Advisors': 'first',
+        'Purpose': 'first',
+        'BeauhurstCompanyURL': 'first',
+        'BeauhurstDealURL': 'first',
+        # Join unique, non-blank investor names with a comma
+        'InvestorName': lambda x: ', '.join(sorted(set([str(i).strip() for i in x if str(i).strip() not in ['nan', 'None', '', 'Unknown']])))
+    }).reset_index()
+    
+    # Rename the aggregated column so it's clear what it is
+    df_flat.rename(columns={'InvestorName': 'All_Investors_In_Round'}, inplace=True)
+    
+    csv_flat = convert_df(df_flat)
+    st.download_button(
+        label="⬇️ Download Round-Level Dataset",
+        data=csv_flat,
+        file_name='beauhurst_rounds_flat.csv',
+        mime='text/csv',
+    )
+
+# Show a quick preview of the flat table to the user
+st.markdown("### Preview: Round-Level Dataset")
+st.dataframe(df_flat[['CompanyName', 'RoundDate', 'RoundAmountGBP_total', 'Company Region', 'All_Investors_In_Round']].head(50), use_container_width=True)
