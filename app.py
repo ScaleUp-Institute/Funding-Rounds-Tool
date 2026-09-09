@@ -89,9 +89,42 @@ def process_beauhurst_file(file):
         inv_mgr_col  = raw_cols_lower.get("fundraising investors - fund manager", "")
         inv_cnty_col = raw_cols_lower.get("fundraising investors - head office country", "")
         inv_amt_col  = raw_cols_lower.get("fundraising investors - amount contributed (converted to gbp)", "")
+        # Comma-free columns: reliable count of how many investors are really in the row
+        inv_url_col  = raw_cols_lower.get("fundraising investors - beauhurst fund url", "")
+        inv_ccy_col  = raw_cols_lower.get("fundraising investors - amount contributed currency", "")
 
         def clean_split(val):
             return [x.strip() for x in str(val).split(',')] if str(val).lower() not in ['nan', 'none', ''] else []
+
+        def repair_names(tokens, n_true):
+            """Investor names are comma-separated, but some fund names contain commas
+            (e.g. HSBC's 'Emerging Technology, Innovation and Ventures'), which splits
+            one investor into several phantoms and shifts every later investor's type,
+            country and amount out of alignment.
+
+            Beauhurst lists the lead investor first, then the rest alphabetically, so an
+            over-split shows up as an alphabetical inversion. We know the true investor
+            count from the comma-free URL/currency columns, so merge at each inversion
+            until the counts agree."""
+            t = list(tokens)
+            if n_true < 1 or len(t) <= n_true:
+                return t
+            guard = 0
+            while len(t) > n_true and guard < 100:
+                guard += 1
+                merged = False
+                for i in range(2, len(t)):
+                    if t[i].lower() < t[i - 1].lower():
+                        t[i - 2] = t[i - 2] + ", " + t[i - 1]
+                        del t[i - 1]
+                        merged = True
+                        break
+                if not merged:
+                    # No inversion to exploit: fold the tail into the last real slot
+                    # rather than dropping investors or misaligning the other lists.
+                    t[n_true - 1] = ", ".join(t[n_true - 1:])
+                    del t[n_true:]
+            return t
 
         for index, row in raw.iterrows():
             base_data = {
@@ -105,6 +138,11 @@ def process_beauhurst_file(file):
             }
 
             names, types, mgrs, cntys, amts = (clean_split(row.get(c, "")) if c else [] for c in [inv_name_col, inv_type_col, inv_mgr_col, inv_cnty_col, inv_amt_col])
+
+            # True investor count comes from a comma-free column; repair over-split names
+            n_true = max((len(clean_split(row.get(c, ""))) for c in [inv_url_col, inv_ccy_col] if c), default=0)
+            if n_true and len(names) > n_true:
+                names = repair_names(names, n_true)
 
             if not names and not types and not mgrs:
                 base_data.update({"InvestorName": np.nan, "InvestorType": "", "InvestorManager": "", "InvestorCountry": "", "InvestorAmountGBP": np.nan})
@@ -243,12 +281,35 @@ search_query = st.sidebar.text_input("Search (Company, Investor, or Advisor)", "
 all_regions = sorted([r for r in df['Region_Display'].unique() if r != 'Nan' and r != 'None'])
 selected_region = st.sidebar.selectbox("Select Region", ["All Regions"] + all_regions)
 
-# Equity Filter
-funding_type = st.sidebar.radio("Funding Type", ["All Funding", "Equity Only", "Non-Equity (Grants, Debt, etc.)"])
+# Deal Date Filter
+year_range = None
+_valid_dates = df['RoundDate'].dropna()
+if not _valid_dates.empty:
+    _yr_min, _yr_max = int(_valid_dates.dt.year.min()), int(_valid_dates.dt.year.max())
+    if _yr_min < _yr_max:
+        year_range = st.sidebar.slider("Deal Year Range", _yr_min, _yr_max, (_yr_min, _yr_max))
+        _undated = df['RoundDate'].isna().sum()
+        if _undated and year_range != (_yr_min, _yr_max):
+            st.sidebar.caption(f"⚠️ {_undated:,} undated deal(s) excluded while this range is narrowed.")
+
+# Equity Filter - only offer Non-Equity if the data actually contains any
+funding_options = ["All Funding", "Equity Only"]
+if (~df['IsEquityRound'].astype(bool)).any():
+    funding_options.append("Non-Equity (Grants, Debt, etc.)")
+funding_type = st.sidebar.radio("Funding Type", funding_options)
+if len(funding_options) == 2:
+    st.sidebar.caption("Every deal in this dataset is equity, so there is no non-equity view.")
 
 # APPLY FILTERS
 if selected_region != "All Regions":
     df = df[df['Region_Display'] == selected_region]
+
+if year_range is not None:
+    _yrs = df['RoundDate'].dt.year
+    if year_range == (_yr_min, _yr_max):
+        df = df[_yrs.between(*year_range) | df['RoundDate'].isna()]
+    else:
+        df = df[_yrs.between(*year_range)]
 
 if funding_type == "Equity Only":
     df = df[df['IsEquityRound'] == True]
@@ -307,26 +368,88 @@ with col_left:
         mask_no_manager = valid_inv['InvestorManager'] == ''
         valid_inv.loc[mask_no_manager, 'InvestorManager'] = valid_inv.loc[mask_no_manager, 'InvestorName']
 
-        funder_stats = valid_inv.groupby('InvestorManager').agg(
-            Deals=('RoundIDKey', 'nunique'),
-            Companies=('CompanyName', 'nunique'),
-            Total_Capital=('InvestorAmountGBP', 'sum')
-        ).reset_index().sort_values(by=['Deals', 'Total_Capital'], ascending=[False, False])
+        # Beauhurst placeholders: these mean "we don't know who invested", not a firm.
+        PLACEHOLDER_FUNDERS = ['undisclosed investors', 'undisclosed investor', 'business angel(s)',
+                               'business angels', 'business angel', 'unknown', '(no value)']
+        is_placeholder = valid_inv['InvestorManager'].str.lower().str.strip().isin(PLACEHOLDER_FUNDERS)
 
-        min_deals = st.number_input(
-            "Minimum deals per funder", min_value=1, max_value=25, value=2, step=1,
-            help="Set to 2 to see every funder involved in 2 or more fundraisings. Set to 1 for the full list."
+        def build_funder_stats(frame):
+            if frame.empty:
+                return pd.DataFrame(columns=['Funder', 'Deals', 'Companies', 'Capital_In_Rounds_GBP', 'Disclosed_Capital_GBP'])
+            stats = frame.groupby('InvestorManager').agg(
+                Deals=('RoundIDKey', 'nunique'),
+                Companies=('CompanyName', 'nunique'),
+                Disclosed_Capital_GBP=('InvestorAmountGBP', 'sum')
+            )
+            # Capital participated in: sum of each DISTINCT round's total. Co-investors each
+            # get the full round, so this double-counts across funders - it measures the scale
+            # of the rounds a funder shows up in, not capital they personally deployed.
+            per_round = frame[['InvestorManager', 'RoundIDKey', 'RoundAmountGBP_total']].drop_duplicates(
+                subset=['InvestorManager', 'RoundIDKey'])
+            stats['Capital_In_Rounds_GBP'] = per_round.groupby('InvestorManager')['RoundAmountGBP_total'].sum()
+            # A 0 here means "the split was never disclosed", so show it as blank, not zero.
+            stats['Disclosed_Capital_GBP'] = stats['Disclosed_Capital_GBP'].replace(0, np.nan)
+            return stats.reset_index().rename(columns={'InvestorManager': 'Funder'})[
+                ['Funder', 'Deals', 'Companies', 'Capital_In_Rounds_GBP', 'Disclosed_Capital_GBP']]
+
+        funder_stats = build_funder_stats(valid_inv[~is_placeholder])
+        placeholder_stats = build_funder_stats(valid_inv[is_placeholder])
+
+        c_a, c_b = st.columns([1, 1.4])
+        with c_a:
+            min_deals = st.number_input(
+                "Minimum deals", min_value=1, max_value=25, value=2, step=1,
+                help="Set to 2 to see every funder involved in 2 or more fundraisings. Set to 1 for the full list."
+            )
+        with c_b:
+            sort_by = st.radio("Rank by", ["Deal count", "Capital in rounds", "Disclosed capital"],
+                               horizontal=True,
+                               help="Disclosed capital is blank for most funders - Beauhurst rarely publishes "
+                                    "who contributed what within a round.")
+
+        SORT_COLS = {"Deal count": ['Deals', 'Capital_In_Rounds_GBP'],
+                     "Capital in rounds": ['Capital_In_Rounds_GBP', 'Deals'],
+                     "Disclosed capital": ['Disclosed_Capital_GBP', 'Deals']}
+        top_funders = funder_stats[funder_stats['Deals'] >= min_deals].sort_values(
+            by=SORT_COLS[sort_by], ascending=False, na_position='last')
+
+        _slots = len(valid_inv)
+        _disclosed = valid_inv['InvestorAmountGBP'].notna().sum()
+        st.caption(
+            f"Showing {len(top_funders):,} funders with {min_deals}+ deals "
+            f"(of {len(funder_stats):,} named funders in the current filters). "
+            f"Grouped by fund manager, so parent firms absorb their individual funds."
         )
-        top_funders = funder_stats[funder_stats['Deals'] >= min_deals]
+        st.dataframe(
+            top_funders, use_container_width=True, hide_index=True, height=420,
+            column_config={
+                "Capital_In_Rounds_GBP": st.column_config.NumberColumn(
+                    "Capital in rounds (£)", format="%.0f",
+                    help="Total size of the rounds this funder took part in. Co-investors each count "
+                         "the full round, so this is reach, not capital deployed."),
+                "Disclosed_Capital_GBP": st.column_config.NumberColumn(
+                    "Disclosed capital (£)", format="%.0f",
+                    help="Only where Beauhurst publishes the individual investor's contribution. "
+                         "Blank means not disclosed - not zero."),
+            }
+        )
+        st.caption(f"ℹ️ Per-investor amounts are disclosed for only {_disclosed:,} of {_slots:,} "
+                   f"investor entries ({_disclosed / _slots:.0%}), so 'Disclosed capital' is blank for most funders.")
 
-        st.caption(f"Showing {len(top_funders):,} funders with {min_deals}+ deals (out of {len(funder_stats):,} funders in the current filters).")
-        st.dataframe(top_funders, use_container_width=True, hide_index=True, height=420)
+        if not placeholder_stats.empty:
+            with st.expander("⚠️ Excluded from the ranking: unnamed / placeholder investors"):
+                st.caption("Beauhurst uses these labels when the investor is not identified. They are not "
+                           "firms, so ranking them alongside real funders is misleading - but the deal "
+                           "volume they represent is real.")
+                st.dataframe(placeholder_stats.sort_values('Deals', ascending=False),
+                             use_container_width=True, hide_index=True)
 
         st.download_button(
             label="⬇️ Download Full Funder Leaderboard",
-            data=top_funders.to_csv(index=False).encode('utf-8'),
-            file_name=f'top_funders_min{min_deals}_deals.csv',
+            data=funder_stats.sort_values(by=SORT_COLS[sort_by], ascending=False, na_position='last').to_csv(index=False).encode('utf-8'),
+            file_name=f'top_funders_all_by_{sort_by.lower().replace(" ", "_")}.csv',
             mime='text/csv',
+            help="Every named funder, no minimum-deal cut-off, in the current sort order."
         )
     else:
         st.info("No investor data available.")
