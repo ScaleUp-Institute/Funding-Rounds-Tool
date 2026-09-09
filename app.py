@@ -389,8 +389,23 @@ with col_left:
             stats['Capital_In_Rounds_GBP'] = per_round.groupby('InvestorManager')['RoundAmountGBP_total'].sum()
             # A 0 here means "the split was never disclosed", so show it as blank, not zero.
             stats['Disclosed_Capital_GBP'] = stats['Disclosed_Capital_GBP'].replace(0, np.nan)
+
+            # Head office country. A manager can roll up funds domiciled in different
+            # countries (e.g. Beringea = US parent + UK ProVen funds), so list every
+            # distinct country rather than silently picking one.
+            _c = frame[['InvestorManager', 'InvestorCountry']].copy()
+            _c['InvestorCountry'] = (_c['InvestorCountry'].fillna('').astype(str).str.strip()
+                                     .replace({'(no value)': '', 'nan': '', 'None': ''}))
+            _c = _c[_c['InvestorCountry'] != '']
+            if not _c.empty:
+                stats['Country'] = _c.groupby('InvestorManager')['InvestorCountry'].agg(
+                    lambda s: ' / '.join(sorted(set(s))))
+            else:
+                stats['Country'] = np.nan
+            stats['Country'] = stats['Country'].fillna('Not disclosed')
+
             return stats.reset_index().rename(columns={'InvestorManager': 'Funder'})[
-                ['Funder', 'Deals', 'Companies', 'Capital_In_Rounds_GBP', 'Disclosed_Capital_GBP']]
+                ['Funder', 'Country', 'Deals', 'Companies', 'Capital_In_Rounds_GBP', 'Disclosed_Capital_GBP']]
 
         funder_stats = build_funder_stats(valid_inv[~is_placeholder])
         placeholder_stats = build_funder_stats(valid_inv[is_placeholder])
