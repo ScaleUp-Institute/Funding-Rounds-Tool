@@ -307,12 +307,27 @@ with col_left:
         mask_no_manager = valid_inv['InvestorManager'] == ''
         valid_inv.loc[mask_no_manager, 'InvestorManager'] = valid_inv.loc[mask_no_manager, 'InvestorName']
 
-        top_funders = valid_inv.groupby('InvestorManager').agg(
+        funder_stats = valid_inv.groupby('InvestorManager').agg(
             Deals=('RoundIDKey', 'nunique'),
+            Companies=('CompanyName', 'nunique'),
             Total_Capital=('InvestorAmountGBP', 'sum')
-        ).reset_index().sort_values(by='Deals', ascending=False).head(20)
-        
-        st.dataframe(top_funders, use_container_width=True, hide_index=True)
+        ).reset_index().sort_values(by=['Deals', 'Total_Capital'], ascending=[False, False])
+
+        min_deals = st.number_input(
+            "Minimum deals per funder", min_value=1, max_value=25, value=2, step=1,
+            help="Set to 2 to see every funder involved in 2 or more fundraisings. Set to 1 for the full list."
+        )
+        top_funders = funder_stats[funder_stats['Deals'] >= min_deals]
+
+        st.caption(f"Showing {len(top_funders):,} funders with {min_deals}+ deals (out of {len(funder_stats):,} funders in the current filters).")
+        st.dataframe(top_funders, use_container_width=True, hide_index=True, height=420)
+
+        st.download_button(
+            label="⬇️ Download Full Funder Leaderboard",
+            data=top_funders.to_csv(index=False).encode('utf-8'),
+            file_name=f'top_funders_min{min_deals}_deals.csv',
+            mime='text/csv',
+        )
     else:
         st.info("No investor data available.")
 
