@@ -205,6 +205,107 @@ def process_beauhurst_file(file):
     return long
 
 # ==========================================
+# FUNDING ROUND-TYPE CLASSIFIER (SUI methodology)
+# ==========================================
+FUNDING_THRESHOLDS_GBP = {"A_max": 15_000_000, "B_max": 50_000_000, "C_max": 100_000_000}
+SEED_YEARS_MAX = 3
+ANGEL_TYPES = {"business angel(s)", "angel network"}
+_SERIES_ORDER = {"SERIES A": 0, "SERIES B": 1, "SERIES C": 2, "SERIES D and above": 3}
+_SERIES_KEYS = list(_SERIES_ORDER.keys())
+_ROUNDTYPE_PRIORITY = ["UNDISCLOSED", "SEED", "SERIES D and above", "SERIES C", "SERIES B", "SERIES A"]
+
+
+def _amount_to_series(x):
+    if pd.isna(x) or x <= 0.01:
+        return None
+    if x <= FUNDING_THRESHOLDS_GBP["A_max"]:
+        return "SERIES A"
+    if x <= FUNDING_THRESHOLDS_GBP["B_max"]:
+        return "SERIES B"
+    if x <= FUNDING_THRESHOLDS_GBP["C_max"]:
+        return "SERIES C"
+    return "SERIES D and above"
+
+
+def add_funding_round_type(long):
+    """Label each round Seed / Angel / Series A-D+ / Undisclosed (SUI methodology).
+
+    Rules:
+      - Undisclosed amount -> UNDISCLOSED
+      - First disclosed round within SEED_YEARS_MAX years of incorporation -> SEED
+      - Otherwise labelled by amount band (A <=15m, B <=50m, C <=100m, D+ >100m),
+        enforced never to step backwards over time within a company (a smaller
+        later round keeps the previous, higher label)
+      - Angel-investor rows are tagged ANGEL
+    Adds two columns:
+      - FundingType : per investor row (an angel row can differ from the round's series)
+      - RoundType   : one label per round (Undisclosed > Seed > highest Series > Angel)
+    """
+    if long.empty:
+        long["FundingType"] = ""
+        long["RoundType"] = ""
+        return long
+
+    long = long.copy()
+    long["RoundAmountGBP_total"] = pd.to_numeric(long["RoundAmountGBP_total"], errors="coerce")
+    long["IncorporationDate"] = pd.to_datetime(long["IncorporationDate"], errors="coerce")
+    long["RoundDate"] = pd.to_datetime(long["RoundDate"], errors="coerce")
+
+    long["Undisclosed"] = long["RoundAmountGBP_total"].isna() | long["RoundAmountGBP_total"].le(0)
+    long["IsAngelInvestorRow"] = long["InvestorType"].astype(str).str.lower().isin(ANGEL_TYPES)
+
+    first = (long.loc[~long["Undisclosed"], ["CompanyName", "RoundDate"]].dropna()
+             .groupby("CompanyName", as_index=False).min()
+             .rename(columns={"RoundDate": "FirstFundingDate"}))
+    long = long.merge(first, on="CompanyName", how="left")
+
+    long["FundingType"] = ""
+    long.loc[long["Undisclosed"], "FundingType"] = "UNDISCLOSED"
+    gap_years = (long["FirstFundingDate"] - long["IncorporationDate"]).dt.days.div(365.25)
+    is_seed = (long["RoundDate"] == long["FirstFundingDate"]) & (~long["Undisclosed"]) & gap_years.le(SEED_YEARS_MAX)
+    long.loc[is_seed.fillna(False), "FundingType"] = "SEED"
+    long["_series_suggested"] = long["RoundAmountGBP_total"].apply(_amount_to_series)
+
+    # Stable tiebreak for the time-ordered walk (survives merges/dedup)
+    if "__rowid" not in long.columns:
+        long = long.reset_index(names="__rowid")
+
+    def _enforce_monotonic(df):
+        df = df.sort_values(["RoundDate", "__rowid"]).copy()
+        highest = -1
+        for i in df.index:
+            if df.at[i, "FundingType"] in {"UNDISCLOSED", "SEED", "ANGEL"}:
+                continue
+            if df.at[i, "IsAngelInvestorRow"]:
+                if df.at[i, "FundingType"] == "":
+                    df.at[i, "FundingType"] = "ANGEL"
+                continue
+            label = df.at[i, "_series_suggested"]
+            if label:
+                idx = _SERIES_ORDER[label]
+                if idx >= highest:
+                    highest = idx
+                    df.at[i, "FundingType"] = label
+                else:
+                    df.at[i, "FundingType"] = _SERIES_KEYS[highest]
+        return df
+
+    # Manual group loop (portable: avoids newer-pandas groupby.apply dropping the key)
+    long = pd.concat(
+        [_enforce_monotonic(grp) for _, grp in long.groupby("CompanyName", sort=False)],
+        ignore_index=True,
+    )
+    long.loc[(long["FundingType"] == "") & (~long["Undisclosed"]) & long["IsAngelInvestorRow"], "FundingType"] = "ANGEL"
+
+    # Round-level single label (one per RoundIDKey)
+    round_type = long.groupby("RoundIDKey")["FundingType"].apply(
+        lambda s: next((v for v in _ROUNDTYPE_PRIORITY if v in set(s)), "ANGEL"))
+    long["RoundType"] = long["RoundIDKey"].map(round_type)
+    long = long.drop(columns=["_series_suggested"], errors="ignore")
+    return long
+
+
+# ==========================================
 # APP UI & STATE MANAGEMENT
 # ==========================================
 st.title("💷 Ultimate Funding Explorer")
@@ -256,7 +357,10 @@ with st.sidebar:
                     master_df['Region_Clean'] = master_df['Company Region'].astype(str).str.lower().str.strip()
                     master_df.loc[master_df['Region_Clean'].isin(['aberdeen', 'east of scotland', 'highlands and islands', 'south of scotland', 'tayside', 'west of scotland']), 'Region_Clean'] = 'scotland'
                     master_df['Region_Display'] = master_df['Region_Clean'].str.title()
-                    
+
+                    # Classify each round (Seed / Angel / Series A-D+ / Undisclosed)
+                    master_df = add_funding_round_type(master_df)
+
                     # Save to state
                     st.session_state.master_df = master_df
                     st.success("✅ Data processed successfully!")
@@ -300,6 +404,14 @@ funding_type = st.sidebar.radio("Funding Type", funding_options)
 if len(funding_options) == 2:
     st.sidebar.caption("Every deal in this dataset is equity, so there is no non-equity view.")
 
+# Funding Round Type Filter
+selected_round_types = None
+if 'RoundType' in df.columns:
+    _rt_order = ["SEED", "ANGEL", "SERIES A", "SERIES B", "SERIES C", "SERIES D and above", "UNDISCLOSED"]
+    _rt_present = [rt for rt in _rt_order if rt in df['RoundType'].dropna().unique()]
+    if _rt_present:
+        selected_round_types = st.sidebar.multiselect("Funding Round Type", _rt_present, default=_rt_present)
+
 # APPLY FILTERS
 if selected_region != "All Regions":
     df = df[df['Region_Display'] == selected_region]
@@ -315,6 +427,9 @@ if funding_type == "Equity Only":
     df = df[df['IsEquityRound'] == True]
 elif funding_type == "Non-Equity (Grants, Debt, etc.)":
     df = df[df['IsEquityRound'] == False]
+
+if selected_round_types:
+    df = df[df['RoundType'].isin(selected_round_types)]
 
 if search_query:
     search_lower = search_query.lower()
@@ -353,6 +468,23 @@ if not timeline_data.empty:
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("Not enough dated round data to plot timeline.")
+
+# -- ROUNDS BY FUNDING TYPE --
+if 'RoundType' in df.columns:
+    st.markdown("### 🏷️ Rounds by Funding Type")
+    _rt_order = ["SEED", "ANGEL", "SERIES A", "SERIES B", "SERIES C", "SERIES D and above", "UNDISCLOSED"]
+    rt_data = (df.drop_duplicates('RoundIDKey')['RoundType']
+               .value_counts().reindex(_rt_order).dropna().reset_index())
+    rt_data.columns = ['Funding Type', 'Rounds']
+    if not rt_data.empty:
+        fig_rt = px.bar(rt_data, x='Funding Type', y='Rounds',
+                        labels={'Rounds': 'Number of Rounds'},
+                        color_discrete_sequence=['#1f77b4'])
+        fig_rt.update_layout(margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig_rt, use_container_width=True)
+    st.caption("First disclosed round within 3 years of incorporation = Seed; later rounds by amount band "
+               "(A ≤£15m, B ≤£50m, C ≤£100m, D+ >£100m), never stepping backwards; "
+               "angel-only rounds = Angel; rounds with no disclosed amount = Undisclosed.")
 
 # ==========================================
 # LEADERBOARDS: FUNDERS & ADVISORS
@@ -535,6 +667,7 @@ with col_dl2:
         'Purpose': 'first',
         'BeauhurstCompanyURL': 'first',
         'BeauhurstDealURL': 'first',
+        'RoundType': 'first',
         # Join unique, non-blank investor names with a comma
         'InvestorName': lambda x: ', '.join(sorted(set([str(i).strip() for i in x if str(i).strip() not in ['nan', 'None', '', 'Unknown']])))
     }).reset_index()
