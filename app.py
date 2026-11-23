@@ -5,6 +5,10 @@ import pandas as pd
 import numpy as np
 from itertools import zip_longest
 import plotly.express as px
+import io
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -310,7 +314,7 @@ def add_funding_round_type(long):
 # INVESTOR NATIONALITY BY FUNDING STAGE (helper)
 # ==========================================
 NAT_COUNTRY_ORDER = ['United Kingdom', 'United States', 'EU', 'Rest of the World']
-NAT_ROUND_ORDER = ['Angel+Seed', 'SERIES A', 'SERIES B', 'SERIES C', 'SERIES D and above']
+NAT_ROUND_ORDER = ['ANGEL', 'SEED', 'SERIES A', 'SERIES B', 'SERIES C', 'SERIES D and above']
 NAT_COLORS = {'United Kingdom': '#D3D3D3', 'United States': '#00A651',
               'EU': '#2E1B83', 'Rest of the World': '#F36F21'}
 _EU_COUNTRIES = {
@@ -378,7 +382,6 @@ def investor_nationality_by_stage(frame):
     if f.empty:
         return empty_counts, empty_counts.astype(float)
 
-    f['FundingType'] = f['FundingType'].replace({'ANGEL': 'Angel+Seed', 'SEED': 'Angel+Seed'})
     f['ConsolidatedCountry'] = f['InvestorCountry'].apply(_bucket_country)
 
     # One presence per round per nationality
@@ -390,6 +393,52 @@ def investor_nationality_by_stage(frame):
     prop = counts.div(row_sums, axis=0).fillna(0)
     pct = prop.apply(_round_to_100, axis=1)
     return counts, pct
+
+
+def plot_nationality_matplotlib(counts, scope_label=""):
+    """Stacked 100% investor-nationality-by-stage chart, styled to match the SUI
+    reference figure (grey UK / green US / navy EU / orange RoW, width 0.8,
+    inward grey ticks, stage labels centred under each bar). Returns a Matplotlib figure."""
+    g = counts.reindex(index=NAT_ROUND_ORDER, columns=NAT_COUNTRY_ORDER).fillna(0)
+    row_sums = g.sum(axis=1).replace(0, np.nan)
+    pct = g.div(row_sums, axis=0).fillna(0) * 100
+    UK = NAT_COLORS['United Kingdom']
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    pct[NAT_COUNTRY_ORDER].plot(kind='bar', stacked=True, ax=ax,
+                                color=[NAT_COLORS[c] for c in NAT_COUNTRY_ORDER],
+                                width=0.8, legend=False)
+
+    ax.set_ylim(0, 100)
+    ax.set_yticks(range(0, 101, 20))
+    ax.set_ylabel(''); ax.set_xlabel('')
+    title = 'Investor Nationality Mix by Stage'
+    if scope_label:
+        title += f'  \u2014  {scope_label}'
+    ax.set_title(title)
+
+    for sp in ['bottom', 'left']:
+        ax.spines[sp].set_visible(True); ax.spines[sp].set_color(UK); ax.spines[sp].set_linewidth(1.0)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    ax.tick_params(axis='y', direction='in', length=4, width=0.8)
+    for tl in ax.yaxis.get_ticklines():
+        tl.set_color(UK)
+
+    # stage labels centred under each bar, with inward grey ticks between bars
+    ax.set_xticks([])
+    labels = list(g.index)
+    n = len(labels)
+    for b in [-0.5] + [i + 0.5 for i in range(n - 1)] + [n - 0.5]:
+        ax.vlines(b, 0, 0.02, transform=ax.get_xaxis_transform(), color=UK, linewidth=0.8)
+    for i, lbl in enumerate(labels):
+        ax.text(i, -0.03, lbl, transform=ax.get_xaxis_transform(),
+                ha='center', va='top', fontsize=8, color='black')
+
+    ax.legend(NAT_COUNTRY_ORDER, title='Investor Nationality', bbox_to_anchor=(1.02, 1),
+              loc='upper left', frameon=False)
+    fig.subplots_adjust(bottom=0.18)
+    fig.tight_layout()
+    return fig
 
 
 # ==========================================
@@ -814,34 +863,26 @@ if 'FundingType' in df.columns and 'InvestorCountry' in df.columns:
     if int(nat_counts.values.sum()) == 0:
         st.info("No investor-nationality data for this selection.")
     else:
-        melt = nat_pct.reset_index().melt(id_vars='FundingType', var_name='Nationality', value_name='Percent')
-        melt['Label'] = melt['Percent'].apply(lambda v: f"{v:.0f}%" if v >= 3 else "")
-        fig_nat = px.bar(
-            melt, x='FundingType', y='Percent', color='Nationality', text='Label',
-            category_orders={'FundingType': NAT_ROUND_ORDER, 'Nationality': NAT_COUNTRY_ORDER},
-            color_discrete_map=NAT_COLORS,
-            title=f"Investor Nationality Mix by Stage \u2014 {_scope}",
-        )
-        fig_nat.update_traces(texttemplate='%{text}', textposition='inside', cliponaxis=False)
-        fig_nat.update_layout(barmode='stack', yaxis_title='% of rounds', yaxis_range=[0, 100],
-                              xaxis_title='', legend_title='Investor Nationality',
-                              margin=dict(t=50, b=10, l=10, r=10))
-        st.plotly_chart(fig_nat, use_container_width=True)
+        scope_title = "" if (nat_region == "Overall (All UK)" and nat_sector == "All sectors") else _scope
+        fig_nat = plot_nationality_matplotlib(nat_counts, scope_title)
+        st.pyplot(fig_nat)
+        _png = io.BytesIO()
+        fig_nat.savefig(_png, format='png', dpi=150, bbox_inches='tight')
+        plt.close(fig_nat)
 
-        _tag = re.sub(r"[^a-z0-9]+", "_", _scope.lower()).strip("_")
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                "\u2B07\uFE0F Download % table (sums to 100)",
-                data=nat_pct.to_csv(index_label='Funding Stage').encode('utf-8'),
-                file_name=f"investor_nationality_pct_{_tag}.csv", mime='text/csv',
-                help="The percentages behind the plot, rounded so each stage sums to exactly 100.")
-        with dl2:
-            st.download_button(
-                "\u2B07\uFE0F Download round counts",
-                data=nat_counts.to_csv(index_label='Funding Stage').encode('utf-8'),
-                file_name=f"investor_nationality_counts_{_tag}.csv", mime='text/csv',
-                help="Raw count of rounds with each nationality present, by stage.")
+        _tag = re.sub(r"[^a-z0-9]+", "_", _scope.lower()).strip("_") or "overall"
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button("\U0001F5BC\uFE0F Download chart (PNG)", data=_png.getvalue(),
+                               file_name=f"investor_nationality_{_tag}.png", mime="image/png")
+        with d2:
+            st.download_button("\u2B07\uFE0F % table (sums to 100)",
+                               data=nat_pct.to_csv(index_label='Funding Stage').encode('utf-8'),
+                               file_name=f"investor_nationality_pct_{_tag}.csv", mime='text/csv')
+        with d3:
+            st.download_button("\u2B07\uFE0F Round counts",
+                               data=nat_counts.to_csv(index_label='Funding Stage').encode('utf-8'),
+                               file_name=f"investor_nationality_counts_{_tag}.csv", mime='text/csv')
 
         with st.expander("Preview the data table"):
             st.dataframe(nat_pct.style.format("{:.1f}"), use_container_width=True)
