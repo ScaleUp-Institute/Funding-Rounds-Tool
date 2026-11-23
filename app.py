@@ -1,4 +1,5 @@
 import re
+import unicodedata as ud
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -306,6 +307,141 @@ def add_funding_round_type(long):
 
 
 # ==========================================
+# INVESTOR NATIONALITY BY FUNDING STAGE (helper)
+# ==========================================
+NAT_COUNTRY_ORDER = ['United Kingdom', 'United States', 'EU', 'Rest of the World']
+NAT_ROUND_ORDER = ['Angel+Seed', 'SERIES A', 'SERIES B', 'SERIES C', 'SERIES D and above']
+NAT_COLORS = {'United Kingdom': '#D3D3D3', 'United States': '#00A651',
+              'EU': '#2E1B83', 'Rest of the World': '#F36F21'}
+_EU_COUNTRIES = {
+    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czech Republic', 'Denmark',
+    'Estonia', 'Finland', 'France', 'Germany', 'Greece', 'Hungary', 'Ireland', 'Italy',
+    'Latvia', 'Lithuania', 'Luxembourg', 'Malta', 'Netherlands', 'Poland', 'Portugal',
+    'Romania', 'Slovakia', 'Slovenia', 'Spain', 'Sweden',
+}
+
+
+def _tidy_country(x):
+    if pd.isna(x):
+        return x
+    x = ud.normalize('NFKC', str(x))
+    return re.sub(r'\s+', ' ', x).strip()
+
+
+def _bucket_country(c):
+    if pd.isna(c):
+        return c
+    c = _tidy_country(c)
+    if c in {'USA', 'U.S.A.', 'US', 'U.S.', 'United States of America'}:
+        c = 'United States'
+    if c in _EU_COUNTRIES:
+        return 'EU'
+    if c == 'United Kingdom':
+        return 'United Kingdom'
+    if c == 'United States':
+        return 'United States'
+    return 'Rest of the World'
+
+
+def _round_to_100(row, decimals=1):
+    """Largest-remainder rounding so each stage's percentages sum to exactly 100."""
+    if row.sum() == 0:
+        return row
+    mult = 10 ** decimals
+    scaled = row * 100 * mult
+    floored = np.floor(scaled)
+    missing = int(round((100 * mult) - floored.sum()))
+    if missing > 0:
+        idx = (scaled - floored).nlargest(missing).index
+        floored.loc[idx] += 1
+    return floored / mult
+
+
+def investor_nationality_by_stage(frame):
+    """UK / US / EU / Rest-of-world investor presence by funding stage.
+
+    Angel and Seed are merged into one stage. Counted once per round per
+    nationality (three UK investors in one round = one UK presence).
+    Returns (round_counts, percentages) where each percentage row sums to 100.
+    """
+    empty_counts = pd.DataFrame(0, index=NAT_ROUND_ORDER, columns=NAT_COUNTRY_ORDER)
+    if frame.empty or 'FundingType' not in frame.columns or 'InvestorCountry' not in frame.columns:
+        return empty_counts, empty_counts.astype(float)
+
+    f = frame.copy()
+    f['InvestorCountry'] = f['InvestorCountry'].astype(str).str.strip()
+    f = f[~f['InvestorCountry'].isin(['Unknown', 'nan', 'NaN', 'None', ''])].dropna(subset=['InvestorCountry'])
+    f = f.dropna(subset=['FundingType'])
+    f = f[f['FundingType'] != '']
+    targets = ['ANGEL', 'SEED', 'SERIES A', 'SERIES B', 'SERIES C', 'SERIES D and above']
+    f = f[f['FundingType'].isin(targets)].copy()
+    if f.empty:
+        return empty_counts, empty_counts.astype(float)
+
+    f['FundingType'] = f['FundingType'].replace({'ANGEL': 'Angel+Seed', 'SEED': 'Angel+Seed'})
+    f['ConsolidatedCountry'] = f['InvestorCountry'].apply(_bucket_country)
+
+    # One presence per round per nationality
+    uniq = f[['RoundIDKey', 'FundingType', 'ConsolidatedCountry']].drop_duplicates()
+    counts = (uniq.groupby(['FundingType', 'ConsolidatedCountry']).size().unstack(fill_value=0)
+              .reindex(index=NAT_ROUND_ORDER, columns=NAT_COUNTRY_ORDER).fillna(0).astype(int))
+
+    row_sums = counts.sum(axis=1).replace(0, pd.NA)
+    prop = counts.div(row_sums, axis=0).fillna(0)
+    pct = prop.apply(_round_to_100, axis=1)
+    return counts, pct
+
+
+# ==========================================
+# SECTOR MAPPING (optional join from the master / company export)
+# ==========================================
+SECTOR_COLS = [
+    'Advanced Manufacturing', 'Clean Energy', 'Creative Industries', 'Defence',
+    'Digital and Technologies', 'Financial Services', 'Life Sciences', 'Professional Services',
+    'Education', 'Hospitality & live entertainment', 'Environment & Agriculture', 'Raw Materials',
+    'Wholesale & retail', 'Construction / Property', 'Care & wellbeing services', 'Transport',
+    'Food Supply Chain', 'Energy',
+]
+
+
+def _norm_chid(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip().upper()
+    if not s or s in ('NAN', 'NONE'):
+        return None
+    # Scottish (SC######), NI (NI######) etc. carry letters - keep them; zero-pad plain numbers
+    return s.zfill(8) if s.isdigit() else s
+
+
+def load_sector_mapping(file):
+    """Read a company export / SUI master carrying sector TRUE/FALSE flags and return
+    one row per company: ['CH_norm', <sector columns present>]. Returns None if the
+    file has no Companies House ID or no recognised sector columns."""
+    try:
+        fname = str(getattr(file, 'name', '') or file).lower()
+        reader = pd.read_excel if fname.endswith(('.xlsx', '.xls')) else pd.read_csv
+        m = reader(file, dtype=str) if reader is pd.read_excel else reader(file, dtype=str, low_memory=False)
+    except Exception:
+        return None
+
+    low = {str(c).strip().lower(): c for c in m.columns}
+    ch_col = next((low[c] for c in ['companies house id', '(company) companies house id', 'company number'] if c in low), None)
+    if ch_col is None:
+        return None
+
+    canon = {s: (s if s in m.columns else low.get(s.lower())) for s in SECTOR_COLS}
+    canon = {s: col for s, col in canon.items() if col is not None}
+    if not canon:
+        return None
+
+    out = pd.DataFrame({'CH_norm': m[ch_col].map(_norm_chid)})
+    for s, col in canon.items():
+        out[s] = m[col].astype(str).str.strip().str.upper().isin(['TRUE', '1', '1.0', 'YES', 'Y'])
+    return out.dropna(subset=['CH_norm']).drop_duplicates('CH_norm')
+
+
+# ==========================================
 # APP UI & STATE MANAGEMENT
 # ==========================================
 st.title("💷 Ultimate Funding Explorer")
@@ -314,6 +450,8 @@ st.markdown("Upload raw Beauhurst exports. We'll automatically clean, unpivot, a
 # Initialize session state for our dataset
 if 'master_df' not in st.session_state:
     st.session_state.master_df = None
+if 'sector_cols' not in st.session_state:
+    st.session_state.sector_cols = []
 
 # --- SIDEBAR: DATA UPLOAD & PROCESSING ---
 with st.sidebar:
@@ -327,6 +465,12 @@ with st.sidebar:
     # Option B: URL Paste
     gdrive_url = st.text_input("Paste a Google Drive / Sheets Link", placeholder="https://docs.google.com/spreadsheets/...")
     st.caption("⚠️ *Note: The Google file must be set to 'Anyone with the link can view'.*")
+
+    st.markdown("**Optional: sector mapping**")
+    sector_file = st.file_uploader(
+        "Company export with sector flags (for per-sector plots)", type=['csv', 'xlsx'],
+        help="The SUI master / the sector-mapping app's output: one row per company with a "
+             "Companies House ID and TRUE/FALSE sector columns. Joined to rounds by CH ID.")
     
     if st.button("Process & Merge Files", type="primary"):
         if uploaded_files or gdrive_url:
@@ -360,6 +504,17 @@ with st.sidebar:
 
                     # Classify each round (Seed / Angel / Series A-D+ / Undisclosed)
                     master_df = add_funding_round_type(master_df)
+
+                    # Optional: join sector flags from a company export / the master
+                    st.session_state.sector_cols = []
+                    if sector_file is not None:
+                        sm = load_sector_mapping(sector_file)
+                        if sm is not None and not sm.empty:
+                            master_df['CH_norm'] = master_df['CompaniesHouseID'].map(_norm_chid)
+                            master_df = master_df.merge(sm, on='CH_norm', how='left').drop(columns=['CH_norm'])
+                            st.session_state.sector_cols = [c for c in sm.columns if c != 'CH_norm']
+                        else:
+                            st.warning("Sector file ignored: no Companies House ID or recognised sector columns found.")
 
                     # Save to state
                     st.session_state.master_df = master_df
@@ -621,6 +776,75 @@ with col_right:
             st.dataframe(top_advisors, use_container_width=True, hide_index=True)
         else:
             st.info("No advisor data available.")
+
+# ==========================================
+# INVESTOR NATIONALITY BY FUNDING STAGE
+# ==========================================
+if 'FundingType' in df.columns and 'InvestorCountry' in df.columns:
+    st.markdown("---")
+    st.subheader("\U0001F30D Investor Nationality by Funding Stage")
+    st.caption("Share of rounds at each stage backed by a UK / US / EU / Rest-of-world investor. "
+               "Counted once per round per nationality (three UK investors in one round = one UK presence). "
+               "Angel and Seed rounds are combined.")
+
+    base_nat = st.session_state.master_df
+    _nat_regions = sorted(r for r in base_nat['Region_Display'].dropna().unique()
+                          if str(r) not in ('Nan', 'None', 'nan'))
+    sector_cols = st.session_state.get('sector_cols', [])
+
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        nat_region = st.selectbox("Region", ["Overall (All UK)"] + _nat_regions, key="nat_region",
+                                  help="Pick a region for its own nationality mix, or keep Overall for the whole UK.")
+    nat_sector = "All sectors"
+    with _c2:
+        if sector_cols:
+            nat_sector = st.selectbox("Sector", ["All sectors"] + sector_cols, key="nat_sector",
+                                      help="From the sector mapping you uploaded. Companies can sit in more than one sector.")
+        else:
+            st.caption("💡 Upload a sector mapping in the sidebar to break these plots down by sector.")
+
+    nat_source = base_nat if nat_region == "Overall (All UK)" else base_nat[base_nat['Region_Display'] == nat_region]
+    if nat_sector != "All sectors" and nat_sector in nat_source.columns:
+        nat_source = nat_source[nat_source[nat_sector] == True]
+
+    _scope = nat_region + ("" if nat_sector == "All sectors" else f" · {nat_sector}")
+    nat_counts, nat_pct = investor_nationality_by_stage(nat_source)
+
+    if int(nat_counts.values.sum()) == 0:
+        st.info("No investor-nationality data for this selection.")
+    else:
+        melt = nat_pct.reset_index().melt(id_vars='FundingType', var_name='Nationality', value_name='Percent')
+        melt['Label'] = melt['Percent'].apply(lambda v: f"{v:.0f}%" if v >= 3 else "")
+        fig_nat = px.bar(
+            melt, x='FundingType', y='Percent', color='Nationality', text='Label',
+            category_orders={'FundingType': NAT_ROUND_ORDER, 'Nationality': NAT_COUNTRY_ORDER},
+            color_discrete_map=NAT_COLORS,
+            title=f"Investor Nationality Mix by Stage \u2014 {_scope}",
+        )
+        fig_nat.update_traces(texttemplate='%{text}', textposition='inside', cliponaxis=False)
+        fig_nat.update_layout(barmode='stack', yaxis_title='% of rounds', yaxis_range=[0, 100],
+                              xaxis_title='', legend_title='Investor Nationality',
+                              margin=dict(t=50, b=10, l=10, r=10))
+        st.plotly_chart(fig_nat, use_container_width=True)
+
+        _tag = re.sub(r"[^a-z0-9]+", "_", _scope.lower()).strip("_")
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "\u2B07\uFE0F Download % table (sums to 100)",
+                data=nat_pct.to_csv(index_label='Funding Stage').encode('utf-8'),
+                file_name=f"investor_nationality_pct_{_tag}.csv", mime='text/csv',
+                help="The percentages behind the plot, rounded so each stage sums to exactly 100.")
+        with dl2:
+            st.download_button(
+                "\u2B07\uFE0F Download round counts",
+                data=nat_counts.to_csv(index_label='Funding Stage').encode('utf-8'),
+                file_name=f"investor_nationality_counts_{_tag}.csv", mime='text/csv',
+                help="Raw count of rounds with each nationality present, by stage.")
+
+        with st.expander("Preview the data table"):
+            st.dataframe(nat_pct.style.format("{:.1f}"), use_container_width=True)
 
 # ==========================================
 # DATA DOWNLOAD
